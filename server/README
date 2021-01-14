@@ -1,0 +1,34 @@
+#安装环境依赖包
+conda install --yes --file requirements.txt
+
+## 进入环境
+conda activate synthesis
+
+## 开启服务端
+nohup python -u server.py -l logdir/server.log > /dev/null &
+
+## 开启工作端
+nohup python -u tgpuworker.py -l logdir/tgpuworker_0.log -c 0 -s person_1 > /dev/null &
+# 或
+# v2版本
+nohup python -u tgpuworker2.py -l logdir/tgpuworker2_0.log -c 0 -s person_1 > /dev/null &
+
+# 或
+bash run.sh 0 0 person_1
+
+## 退出环境
+conda deactivate
+
+## 开启日志备份和清理
+# 必须先开启当前用户的cron功能，具体是将当前用户名写入/etc/cron.allow
+# 更改update.crontab中server所对应的目录，这个目录的绝对路径会因为安装位置的不同而改变，所以需要依据实际做修改。
+crontab update.crontab
+
+## 关闭日志备份和清理
+crontab -r
+
+## 关闭服务器
+bash kill.sh server
+
+## 关闭工作端(所有)
+bash kill.sh worker

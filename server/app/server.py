@@ -1,0 +1,103 @@
+import tornado
+from config import settings, BUFFER_SIZE,nclient_per_gpu
+import json
+from view.server import TClientSocketHandler, TGPUSocketHandler, StatusSocketHandler
+from view.server_v2 import TClientSocketHandler2, TGPUSocketHandler2
+import queue, _thread
+from  multiprocessing import cpu_count
+import logging
+import psutil
+
+def get_logname(conf, name, default='logging'):
+    return conf[name][0] if name in conf else default
+
+class ServerApp(tornado.web.Application):
+    def __init__(self, conf):
+        handlers = [
+            (r'/tclient', TClientSocketHandler, {'logname': get_logname(conf, 'tclient')}),
+            (r'/tgpu', TGPUSocketHandler, {'logname': get_logname(conf, 'tgpu')}),
+            (r'/status', StatusSocketHandler),
+            # add v2
+            (r'/tclient2', TClientSocketHandler2, {'logname': get_logname(conf, 'tclient')}),
+            (r'/tgpu2', TGPUSocketHandler2, {'logname': get_logname(conf, 'tgpu')}),
+        ]
+        super(ServerApp, self).__init__(handlers, **settings)
+        self.available_workers = set()
+        self.status_listeners = set()
+        self.num_requests_processed = 0
+        self.num_running_tasks = 0
+        self.percent_cpu_used = 0.0
+        self.num_mem_total = 0
+        self.num_mem_used = 0
+        self.num_mem_free = 0
+        self.num_mem_buffers = 0
+        self.num_mem_cached = 0
+        self.logger = logging.getLogger(get_logname(conf, 'server'))
+
+        # Tacotron-2
+        self.tclients = list()
+        self.tgpus = dict()
+        self.free_tgpus = set()
+
+    def send_status_update_single(self, ws):
+
+        self.percent_cpu_used = psutil.cpu_percent()
+        mem = psutil.virtual_memory()
+
+        self.num_mem_total = mem.total
+        self.num_mem_used = mem.used
+        self.num_mem_free = mem.free
+        self.num_mem_buffers = mem.buffers
+        self.num_mem_cached = mem.cached
+
+        status = dict(num_workers_available=sum(list(self.tgpus.values()))*nclient_per_gpu,
+                      status_listeners=len(self.status_listeners),
+                      num_requests_processed=self.num_requests_processed,
+                      num_running_tasks=self.num_running_tasks,
+                      percent_cpu_used=self.percent_cpu_used,
+                      num_mem_total=self.num_mem_total,
+                      num_mem_used=self.num_mem_used,
+                      num_mem_free=self.num_mem_free,
+                      num_mem_buffers=self.num_mem_buffers,
+                      num_mem_cached=self.num_mem_cached,
+                      num_logical_cores=cpu_count())
+        #ws.write_message(json.dumps(status))
+
+        #status = dict(num_workers_available=len(self.available_workers), status_listeners=len(self.status_listeners))
+        try:
+            ws.write_message(json.dumps(status))
+        except tornado.websocket.WebSocketClosedError as e:
+            pass
+
+    def send_status_update(self):
+        for ws in self.status_listeners:
+            self.send_status_update_single(ws)
+
+    def server_status(self):
+        msg = 'Now we have {} available TGPU worker in total: '.format(sum(list(self.tgpus.values())))
+        msg += ', '.join(['{} for {}'.format(num, spkid) for (spkid, num) in self.tgpus.items()])
+        return msg
+
+    # for Tacotron-2
+    def get_tasks(self, spkid, top_n):
+        ''' return [client], [txt] '''
+        # clients = list(filter(lambda client: client.num_waits, self.tclients))
+        # clients = list(filter(lambda client: spkid in client.task_queue and not client.task_queue[spkid].empty(), clients))
+        clients = list(filter(lambda client: spkid in client.task_queue and not client.task_queue[spkid].empty(), self.tclients))
+        clients.sort(key=lambda client: client.priority + 3 * client.num_doing)
+        clients = clients[:top_n]
+        if len(clients) == 0:
+            return [], []
+        tasks = [client.task_queue[spkid].get() for client in clients]
+        for client in clients:
+            client.num_waits -= 1
+            client.num_doing += 1
+        txts, indexes = zip(*tasks)
+        clients = list(zip(clients, indexes))
+        txts = list(txts)
+        if len(clients) < top_n:
+            subclients, subtxts = self.get_tasks(spkid, top_n - len(clients))
+            clients.extend(subclients)
+            txts.extend(subtxts)
+        
+        return clients, txts
